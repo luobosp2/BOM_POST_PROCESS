@@ -1,0 +1,17 @@
+# Legacy sources are retained locally for migration, but not versioned.
+/BOM处理/
+/BOM的WORD标准化/
+
+# Generated artifacts and local environments.
+/output/
+/.work/
+/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+.coverage
+htmlcov/
+~$*
