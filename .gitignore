@@ -1,7 +1,3 @@
-# Legacy sources are retained locally for migration, but not versioned.
-/BOM处理/
-/BOM的WORD标准化/
-
 # Generated artifacts and local environments.
 /output/
 /.work/
@@ -15,3 +11,4 @@ __pycache__/
 .coverage
 htmlcov/
 ~$*
+/node.*.log
