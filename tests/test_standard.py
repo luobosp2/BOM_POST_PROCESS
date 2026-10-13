@@ -61,15 +61,28 @@ class ExcelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "找不到工作表"):
             read_bom(self.path, "不存在")
 
-    def test_prefers_welding_sheet_and_requires_unambiguous_fallback(self):
+    def test_prefers_procurement_sheet_and_requires_unambiguous_fallback(self):
         rows = [COLUMNS, ["1", "ABC", "器件", "1", "U1", ""]]
         workbook(self.path, [("说明", [["说明文字"]]), ("已解析BOM", rows)])
         self.assertEqual(read_bom(self.path)[0], "已解析BOM")
-        workbook(self.path, [("其他BOM", rows), ("焊接表", rows)])
-        self.assertEqual(read_bom(self.path)[0], "焊接表")
+        workbook(self.path, [("其他BOM", rows), ("焊接表", rows), ("BOM", rows)])
+        self.assertEqual(read_bom(self.path)[0], "BOM")
+        workbook(self.path, [("其他BOM", rows), ("焊接表", rows), ("未焊接元件", rows)])
+        self.assertEqual(read_bom(self.path)[0], "其他BOM")
         workbook(self.path, [("BOM1", rows), ("BOM2", rows)])
         with self.assertRaisesRegex(StandardError, "多个工作表"):
             read_bom(self.path)
+
+    def test_soldering_only_workbooks_require_procurement_export(self):
+        rows = [COLUMNS, ["1", "ABC", "器件", "1", "U1", ""]]
+        for name in ("焊接表", "未焊接元件"):
+            with self.subTest(sheet=name):
+                workbook(self.path, [(name, rows)])
+                with self.assertRaisesRegex(StandardError, "不能作为采购 BOM.*gen_bom"):
+                    read_bom(self.path)
+                workbook(self.path, [(name, rows), ("BOM", rows)])
+                with self.assertRaisesRegex(StandardError, "不能作为采购 BOM.*gen_bom"):
+                    read_bom(self.path, name)
 
     def test_duplicate_required_header_rejected(self):
         workbook(self.path, [("BOM", [list(COLUMNS) + ["备注"], ["1", "R", "电阻", "1", "R1", "", ""]])])
@@ -78,7 +91,7 @@ class ExcelTests(unittest.TestCase):
 
     def test_missing_header_and_empty_data_rejected(self):
         workbook(self.path, [("BOM", [["名称"], ["电阻"]])])
-        with self.assertRaisesRegex(ValueError, "缺少表头"):
+        with self.assertRaisesRegex(ValueError, "缺少表头.*gen_bom"):
             read_bom(self.path)
         workbook(self.path, [("BOM", [COLUMNS])])
         with self.assertRaisesRegex(ValueError, "没有 BOM 数据"):
@@ -193,10 +206,10 @@ class ExportTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.input = self.root / "welding.xlsx"
+        self.input = self.root / "procurement.xlsx"
         self.output = self.root / "standard.docx"
         self.records = [["1", "0402", "电阻", "1", "R1", "10kΩ\n1%"]]
-        workbook(self.input, [("焊接表", [COLUMNS] + self.records)])
+        workbook(self.input, [("BOM", [COLUMNS] + self.records)])
 
     @staticmethod
     def render(_path, *, pdf=None):
@@ -209,7 +222,7 @@ class ExportTests(unittest.TestCase):
              patch("bom_post_process.standard.paginate", return_value=([self.records], [0])), \
              patch("bom_post_process.standard.WordLayout.render", side_effect=self.render):
             result = export_standard_bom(self.input, self.output)
-        self.assertEqual((result.items, result.pages, result.sheet), (1, 1, "焊接表"))
+        self.assertEqual((result.items, result.pages, result.sheet), (1, 1, "BOM"))
         self.assertTrue(all(p.exists() for p in (result.output, result.pdf, result.audit)))
         audit = json.loads(result.audit.read_text(encoding="utf-8"))
         self.assertTrue(audit["data_verified"] and audit["layout_verified"] and audit["categories_verified"])
@@ -219,8 +232,9 @@ class ExportTests(unittest.TestCase):
         remarks = ("  人工选型：0603 / 22kΩ / ±0.1% / 0.1W  \n"
                    "替代型号：RC0603FR-0722KL；按最终选型焊接\n\n"
                    "保留字符 & < >，备注数值优先于 Comment\n")
-        records = [["007", "0402-1002F", "电阻", "2", "R1, R2", remarks]]
-        workbook(self.input, [("焊接表", [COLUMNS] + records)])
+        name = "  人工选择的精密电阻 & < >  "
+        records = [["007", "0402-1002F", name, "2", "R1, R2", remarks]]
+        workbook(self.input, [("BOM", [COLUMNS] + records)])
         original = self.input.read_bytes()
         with patch("bom_post_process.standard.check_word_available"), \
              patch("bom_post_process.standard.paginate",
@@ -229,8 +243,27 @@ class ExportTests(unittest.TestCase):
             result = export_standard_bom(self.input, self.output)
         exported, _ = read_exported_content(result.output, Template(RESOURCES / "bom_template.docx"))
         self.assertEqual(exported, records)
+        self.assertEqual(exported[0][2], name)
         self.assertEqual(exported[0][5], remarks)
         self.assertEqual(self.input.read_bytes(), original)
+
+    def test_procurement_pcb_placeholder_has_both_category_headings(self):
+        records = [["1", "PCB制板", "PCB制板", "", "", "PCB制板的占位符"],
+                   ["2", "0402K1002", "人工名称", "1", "R1", "人工选型"]]
+        # 焊接表可能含未采购器件；Word 应读取 BOM 表中的名称、备注与 PCB 占位。
+        welding = [["1", "NOT_BOUGHT", "无需采购", "1", "TP1", "不应导出"]]
+        workbook(self.input, [("焊接表", [COLUMNS] + welding), ("BOM", [COLUMNS] + records)])
+        with patch("bom_post_process.standard.check_word_available"), \
+             patch("bom_post_process.standard.paginate",
+                   side_effect=lambda _template, rows, _layout, _work: ([rows], [0])), \
+             patch("bom_post_process.standard.WordLayout.render", side_effect=self.render):
+            result = export_standard_bom(self.input, self.output)
+        exported, categories = read_exported_content(result.output, Template(RESOURCES / "bom_template.docx"))
+        self.assertEqual(exported, records)
+        self.assertEqual(categories, [(0, "外协件"), (1, "外购件")])
+        self.assertEqual((result.items, result.sheet), (2, "BOM"))
+        audit = json.loads(result.audit.read_text(encoding="utf-8"))
+        self.assertEqual(audit["category_rows"], 2)
 
     def test_verification_failure_does_not_publish_anything(self):
         with patch("bom_post_process.standard.check_word_available"), \

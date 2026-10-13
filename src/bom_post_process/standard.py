@@ -1,4 +1,4 @@
-"""Export a welding workbook using the supplied, Word-measured BOM template."""
+"""Export a procurement workbook using the supplied, Word-measured BOM template."""
 from __future__ import annotations
 
 import copy
@@ -297,14 +297,18 @@ class Template:
 
 
 def read_bom(path: Path, sheet_name: str | None = None) -> tuple[str, list[list[str]]]:
-    """Read six named columns; prefer 焊接表, otherwise require one matching sheet."""
+    """Read a procurement table, excluding known soldering-only worksheets."""
+    soldering_sheets = {"焊接表", "未焊接元件"}
+    wrong_source = "焊接表或未焊接元件不能作为采购 BOM；请从人工修改后的已解析表运行 gen_bom，再将其结果转换为 Word。"
     with zipfile.ZipFile(path) as archive:
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
         sheets = workbook.findall("s:sheets/s:sheet", NS)
         names = [s.get("name") for s in sheets]
         if sheet_name and sheet_name not in names:
             raise StandardError(f"找不到工作表 {sheet_name!r}；可用：{names}")
-        selected = sheet_name or ("焊接表" if "焊接表" in names else None)
+        if sheet_name in soldering_sheets:
+            raise StandardError(wrong_source)
+        selected = sheet_name or ("BOM" if "BOM" in names else None)
         relations = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
         targets = {r.get("Id"): r.get("Target") for r in relations}
         strings = []
@@ -330,6 +334,8 @@ def read_bom(path: Path, sheet_name: str | None = None) -> tuple[str, list[list[
 
         candidates = []
         for sheet in sheets:
+            if sheet.get("name") in soldering_sheets:
+                continue
             if selected and sheet.get("name") != selected:
                 continue
             target = targets[sheet.get(f"{{{NS['r']}}}id")]
@@ -345,8 +351,10 @@ def read_bom(path: Path, sheet_name: str | None = None) -> tuple[str, list[list[
                     candidates.append((sheet.get("name"), headers, rows[index + 1:]))
                     break
         if not candidates:
-            raise StandardError("Excel 缺少表头（焊接表），必需列：" + "、".join(COLUMNS)
-                                + "；请先运行 gen_value，完成人工选型后再运行 gen_soldering。")
+            if not selected and soldering_sheets.intersection(names):
+                raise StandardError(wrong_source)
+            raise StandardError("Excel 缺少表头（采购 BOM），必需列：" + "、".join(COLUMNS)
+                                + "；请先运行 gen_value，完成人工选型后运行 gen_bom，再将其结果转换为 Word。")
         if len(candidates) > 1:
             raise StandardError("多个工作表符合 BOM 表头，请使用 --sheet 指定："
                                 + "、".join(candidate[0] for candidate in candidates))
@@ -369,7 +377,7 @@ def windows_path(path: Path) -> str:
 def check_word_available() -> None:
     """Check the required Windows/Word installation before export."""
     if os.name != "nt":
-        raise StandardError("Word 标准化需要 Windows 和已安装的桌面版 Microsoft Word；validate、gen_value 和 gen_soldering 可独立使用。")
+        raise StandardError("Word 标准化需要 Windows 和已安装的桌面版 Microsoft Word；validate、gen_value、gen_soldering 和 gen_bom 可独立使用。")
     if not shutil.which("powershell.exe"):
         raise StandardError("未找到 powershell.exe；Word 标准化需要 Windows PowerShell。")
     import winreg

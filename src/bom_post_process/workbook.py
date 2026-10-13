@@ -154,27 +154,9 @@ def save_bytes_exclusive(data: bytes, output: Path) -> None:
             raise
 
 
-def select_bom_sheet(workbook, sheet: str | None = None):
-    """Select a six-column, editable Chinese BOM table by its header."""
-    def matches(candidate):
-        return tuple(cell_text(candidate.cell(1, column).value).strip() for column in range(1, 7)) == BOM_HEADERS
-
-    if sheet is not None:
-        if sheet not in workbook.sheetnames:
-            raise BomError(f"找不到工作表：{sheet}")
-        candidate = workbook[sheet]
-        if not matches(candidate):
-            raise BomError(f"工作表“{sheet}”应有六列表头：" + "、".join(BOM_HEADERS))
-        return candidate
-    candidates = [candidate for candidate in workbook.worksheets if matches(candidate)]
-    if len(candidates) > 1:
-        raise BomError("存在多个整理后 BOM 表，请使用 --sheet 指定工作表")
-    return candidates[0] if candidates else None
-
-
-def select_note_sheet(workbook, sheet: str | None = None):
-    """Find an AD table with editable note cells, retaining its column order."""
-    required = {name.casefold() for name in AD_HEADERS} | {"note"}
+def select_reviewed_sheet(workbook, sheet: str | None = None):
+    """Find the parsed AD table with all four manually editable columns."""
+    required = {name.casefold() for name in AD_HEADERS} | {"name", "note", "not_bought", "not_welded"}
     if sheet is not None and sheet not in workbook.sheetnames:
         raise BomError(f"找不到工作表：{sheet}")
     candidates = []
@@ -183,8 +165,11 @@ def select_note_sheet(workbook, sheet: str | None = None):
         if required <= labels:
             candidates.append((candidate, header_map(candidate)))
     if len(candidates) > 1:
-        raise BomError("存在多个含 note 的 AD 表，请使用 --sheet 指定已编辑的工作表")
-    return candidates[0] if candidates else None
+        raise BomError("存在多个已解析的 AD 表，请使用 --sheet 指定已编辑的工作表")
+    if not candidates:
+        raise BomError("缺少已解析的 AD 表及 name、note、not_bought、not_welded 四列；"
+                       "请先运行 gen_value 并人工修改后再导出")
+    return candidates[0]
 
 
 def copy_style(source, target) -> None:

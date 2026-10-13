@@ -18,9 +18,10 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     descriptions = {
         "validate": "检查 Comment 与 Footprint 冲突及位号、数量",
-        "gen_value": "保留原表和样式，在末尾 note 列补充电阻电容参数",
-        "gen_soldering": "从已填写 note 的 BOM 导出焊接表和未焊接元件表",
-        "gen_bom_standard": "从焊接表生成标准化 Word、PDF 和分页核验记录",
+        "gen_value": "保留原表和样式，追加 name、note、not_bought、not_welded 四列",
+        "gen_soldering": "从人工修改后的参数表导出焊接表，排除 not_welded 非空行",
+        "gen_bom": "从人工修改后的参数表导出采购 BOM，排除 not_bought 非空行",
+        "gen_bom_standard": "从采购 BOM Excel 生成标准化 Word、PDF 和分页核验记录",
     }
     for name, description in descriptions.items():
         command = commands.add_parser(name, help=description, description=description)
@@ -28,8 +29,6 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--sheet", help="输入工作表名；默认自动识别")
         command.add_argument("-o", "--output", type=Path,
                              help="输出路径；validate 为可选 JSON 报告，其他命令默认写入 output/")
-        if name == "gen_soldering":
-            command.add_argument("--ad-sheet", help="用于判断 NC 的 AD 原始表名；存在多张时必须指定")
         if name == "gen_bom_standard":
             command.add_argument("--template", type=Path, help="自定义两页 Word 模板")
             command.add_argument("--config", type=Path, help="表尾文字 JSON 配置")
@@ -81,7 +80,9 @@ def _show_values(report) -> None:
     for issue in report.issues:
         print(f"提示：第 {issue.row} 行，{issue.model!r}：{issue.reason}", file=sys.stderr)
     print(f"待人工调整的参数表：{report.output}")
-    print("请在原工作表的 note 列填写选型备注并保存，再运行 gen_soldering 导出焊接表。")
+    print("name 已预填可识别元件名称；新建 not_welded 列时，NC 条目会自动标记为 NC。")
+    print("请编辑 name、note；不采购的条目填写 not_bought，不焊接的条目填写 not_welded。")
+    print("保存后分别运行 gen_soldering 和 gen_bom；再对 gen_bom 的结果运行 gen_bom_standard。")
 
 
 def _show_standard(report) -> None:
@@ -116,16 +117,27 @@ def _run(args: argparse.Namespace) -> int:
 
         stem = args.input.stem.removesuffix("_已解析")
         output = args.output or Path("output") / f"{stem}_焊接表.xlsx"
-        report = gen_soldering(args.input, output, sheet=args.sheet, ad_sheet=args.ad_sheet)
-        print(f"焊接 {report.written} 行，未焊接 {report.excluded_nc} 行；"
-              f"排除 PCB 占位 {report.excluded_pcb} 行。")
+        report = gen_soldering(args.input, output, sheet=args.sheet)
+        print(f"焊接表 {report.written} 行；按 not_welded 排除 {report.excluded} 行。")
         print(f"焊接表：{report.output}")
+        return 0
+
+    if args.command == "gen_bom":
+        from .bom import gen_bom
+
+        stem = args.input.stem.removesuffix("_已解析")
+        output = args.output or Path("output") / f"{stem}_BOM.xlsx"
+        report = gen_bom(args.input, output, sheet=args.sheet)
+        print(f"采购 BOM {report.written} 行；按 not_bought 排除 {report.excluded} 行。")
+        if report.pcb_placeholder:
+            print("已添加 PCB 制板占位行，数量留空，可在 BOM Excel 中补充。")
+        print(f"采购 BOM：{report.output}")
         return 0
 
     if args.command == "gen_bom_standard":
         from .standard import export_standard_bom
 
-        stem = args.input.stem.removesuffix("_焊接表")
+        stem = args.input.stem.removesuffix("_BOM")
         output = args.output or Path("output") / f"{stem}_标准化.docx"
         _show_standard(export_standard_bom(args.input, output, sheet=args.sheet,
                                           template=args.template, config=args.config))
