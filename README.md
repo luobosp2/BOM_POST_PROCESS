@@ -6,7 +6,7 @@
 
 ```text
 AD 原始 BOM
-    → validate 检查封装、位号和数量
+    → validate 检查封装、位号和数量，提醒同料号不同 Footprint 的条目合并
     → gen_value 复制原工作簿，追加 name、note、not_bought、not_welded
     → 人工修改名称、选型备注及采购/焊接标记并保存
         ├─ gen_soldering → 焊接表 Excel（只看 not_welded）
@@ -100,7 +100,15 @@ Comment | Description | Designator | Footprint | LibRef | Quantity | name | note
 
 `validate` 对符合本项目命名规则的电阻、电容比较 Comment 和 Footprint 中的封装尺寸及 C/R 器件类型，支持 `C0402`、`C 0402L`、`CAP_0402`、`0402C`、`R0402`、`RES-0402`、`0402R`、`0402` 等别名；还检查空位号、重复位号、数量与位号个数是否一致。
 
-只对完整匹配的料号进行封装比较，不把 `M1206` 等芯片料号中的数字当成封装。未知料号或封装别名会标记为未验证。报告中 `checked` 是已比较行数，`skipped` 是未比较行数；`ok=true` 仅表示未发现错误，不表示所有元件均完成验证。`validate` 检查 AD 列，不验证人工填写的 note 中的选型说明。
+Comment 命名与封装一致性规则仅用于已识别的电阻、电容（包含极性电容）。芯片、连接器、LED、测试点、定位点等其他器件跳过该规则，不再因料号不符合电阻电容命名而产生 warning；所有条目仍检查位号、数量及必填的 Comment、Footprint。对已识别的电阻电容，只在完整匹配料号规则时比较封装，无法解析的厂商型号或未知封装别名仍提示未验证，不把 `M1206` 等芯片料号中的数字当成封装。
+
+报告中 `checked` 是已比较行数，`skipped` 是未比较行数，包含正常跳过的其他器件及无法比较的电阻电容；并不是每个 skipped 条目都有 warning。`ok=true` 仅表示未发现错误，不表示所有元件均完成验证。`validate` 检查 AD 列，不验证人工填写的 note 中的选型说明。
+
+`validate` 还会跨行检查电阻、电容：同一个 Comment 对应多个不同的 Footprint 时，每组给出一条合并提示（`same_comment_different_footprints`），列出相关行号、位号和原始 Footprint，供人工核对封装并合并 BOM 条目。元件身份通过现有料号规则或 LibRef 识别，包含极性电容及能由 LibRef 识别的厂商型号，不要求参数解析成功。
+
+比较 Comment 和 Footprint 时忽略大小写和首尾空格，保留内部空格及 NC 后缀；例如 `R0402` 与 `0402R` 仍算不同 Footprint，带 `/NC` 的 Comment 不与普通 Comment 合为一组。空 Comment 或空 Footprint 由原有缺失检查处理，不参与分组。终端完整显示所有合并提示，其他普通提示最多显示 8 条；`validate -o` 的 JSON 保存完整报告。
+
+合并提示属于 warning，不改变 `checked/skipped` 的含义；仅有提示时退出码仍为 `0`。校验不修改 Excel，也不会自动合并或阻止后续解析、焊接表、采购 BOM 和 Word 导出。样例 `input/DAQ_1010A_V1R0.xlsx` 会报告 5 条电容型号未验证提示和 6 组合并提示，总计 11 条提示、0 个错误；封装比较仍为 91 行已比较、51 行未比较，其中 46 行其他器件正常跳过。
 
 | 类型 | 示例 Comment | 备注输出 |
 | --- | --- | --- |

@@ -17,7 +17,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     descriptions = {
-        "validate": "检查 Comment 与 Footprint 冲突及位号、数量",
+        "validate": "检查电阻电容封装冲突及同料号拆行，并检查所有元件的位号和数量",
         "gen_value": "保留原表和样式，追加 name、note、not_bought、not_welded 四列",
         "gen_soldering": "从人工修改后的参数表导出焊接表，排除 not_welded 非空行",
         "gen_bom": "从人工修改后的参数表导出采购 BOM，排除 not_bought 非空行",
@@ -60,11 +60,13 @@ def _show_validation(report) -> None:
           f"错误 {report.errors}，提示 {report.warnings}。")
     errors = [issue for issue in report.issues if issue.severity == "error"]
     warnings = [issue for issue in report.issues if issue.severity != "error"]
-    for issue in errors + warnings[:8]:
+    merge_warnings = [issue for issue in warnings if issue.code == "same_comment_different_footprints"]
+    other_warnings = [issue for issue in warnings if issue.code != "same_comment_different_footprints"]
+    for issue in errors + merge_warnings + other_warnings[:8]:
         label = "错误" if issue.severity == "error" else "提示"
         print(f"{label}：第 {issue.row} 行 [{issue.designator}] {issue.message}", file=sys.stderr)
-    if len(warnings) > 8:
-        print(f"另有 {len(warnings) - 8} 条提示；可通过 validate -o 把完整结果保存为 JSON。", file=sys.stderr)
+    if len(other_warnings) > 8:
+        print(f"另有 {len(other_warnings) - 8} 条提示；可通过 validate -o 把完整结果保存为 JSON。", file=sys.stderr)
 
 
 def _validation_json(report) -> dict:

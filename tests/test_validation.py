@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from bom_post_process.errors import BomError
 from bom_post_process.validation import validate_workbook
@@ -38,7 +38,10 @@ class ValidationTests(unittest.TestCase):
         report = validate_workbook(self.source)
         self.assertTrue(report.ok)
         self.assertEqual((report.checked, report.skipped), (9, 0))
-        self.assertEqual(report.issues, ())
+        self.assertEqual([issue.code for issue in report.issues],
+                         ["same_comment_different_footprints"] * 2)
+        self.assertEqual([issue.row for issue in report.issues], [2, 7])
+        self.assertEqual((report.errors, report.warnings), (0, 2))
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), before)
 
     def test_package_and_component_type_conflicts(self):
@@ -59,7 +62,7 @@ class ValidationTests(unittest.TestCase):
     def test_unknown_models_and_ambiguous_footprints_are_unverified(self):
         self.write_rows([
             ["IC_M1206", "", "U1", "M1220", "", 1],
-            ["1206B104K101NT(FH)", "", "C1", "C0402", "", 1],
+            ["1206B104K101NT(FH)", "", "C1", "C0402", "Cap", 1],
             ["0402K1002", "", "R1", "R0402/C0603", "", 1],
             ["0402K1002", "", "R2", "M0402", "", 1],
         ])
@@ -67,8 +70,202 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(report.ok)
         self.assertEqual((report.checked, report.skipped, report.warnings), (0, 4, 4))
         self.assertEqual([issue.code for issue in report.issues],
-                         ["unsupported_comment", "unsupported_comment",
-                          "unknown_footprint", "unknown_footprint"])
+                         ["unsupported_comment", "unknown_footprint", "unknown_footprint",
+                          "same_comment_different_footprints"])
+        self.assertEqual(report.issues[0].row, 3)
+
+    def test_multiple_footprints_produce_one_group_warning_with_every_row(self):
+        comment = "0402-X5R104K250"
+        rows = [
+            [comment, "", "C1,C2", "C0402", "Cap", 2],
+            [comment, "", "C3", "C 0402L", "Cap", 1],
+            [comment, "", "C4", "CAP_0402", "Cap", 1],
+            [comment, "", "C5", "C0402", "Cap", 1],
+        ]
+        self.write_rows(rows)
+        before = self.source.read_bytes()
+        report = validate_workbook(self.source)
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (4, 0, 0, 1))
+        self.assertTrue(report.ok)
+        issue, = report.issues
+        self.assertEqual((issue.severity, issue.code, issue.row),
+                         ("warning", "same_comment_different_footprints", 2))
+        self.assertEqual((issue.comment, issue.designator, issue.footprint), (comment, "C1,C2", "C0402"))
+        self.assertIn(comment, issue.message)
+        self.assertIn("请核对封装并合并对应 BOM 条目", issue.message)
+        for row_number, row in enumerate(rows, start=2):
+            self.assertRegex(issue.message, rf"第\s*{row_number}\s*行")
+            self.assertIn(row[2], issue.message)
+            self.assertIn(row[3], issue.message)
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertEqual(list(self.source.parent.iterdir()), [self.source])
+
+    def test_case_and_outer_whitespace_are_ignored_for_group_comparison(self):
+        self.write_rows([
+            [" 0402k1002 ", "", "R1", " R0402 ", "", 1],
+            ["0402K1002", "", "R2", "r0402", "", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (2, 0, 0, 0))
+        self.assertEqual(report.issues, ())
+
+    def test_internal_footprint_whitespace_stays_significant_and_raw_text_is_preserved(self):
+        self.write_rows([
+            [" 0402k1002 ", "", "R1", " R0402 ", "", 1],
+            ["0402K1002", "", "R2", "r0402", "", 1],
+            ["0402k1002", "", "R3", "R 0402", "", 1],
+        ])
+        report = validate_workbook(self.source)
+        issue, = report.issues
+        self.assertEqual(issue.code, "same_comment_different_footprints")
+        self.assertEqual((issue.comment, issue.footprint), (" 0402k1002 ", " R0402 "))
+        self.assertIn(" 0402k1002 ", issue.message)
+        for footprint in (" R0402 ", "r0402", "R 0402"):
+            self.assertIn(footprint, issue.message)
+        self.assertEqual((report.checked, report.skipped), (3, 0))
+
+    def test_nc_suffixes_remain_separate_comments_including_parenthesized_form(self):
+        self.write_rows([
+            ["0402K1002", "", "R1", "R0402", "Res", 1],
+            ["0402K1002/NC", "", "R2", "R 0402", "Res", 1],
+            ["0402K1002(NC)", "", "R3", "RES_0402", "Res", 1],
+        ])
+        self.assertEqual(validate_workbook(self.source).issues, ())
+        book = load_workbook(self.source)
+        book.active.append([" 0402k1002/nc ", "", "R4", "RES-0402", "Res", 1])
+        book.save(self.source)
+        book.close()
+        report = validate_workbook(self.source)
+        issue, = report.issues
+        self.assertEqual((issue.row, issue.comment), (3, "0402K1002/NC"))
+        self.assertIn("R2", issue.message)
+        self.assertIn("R4", issue.message)
+        self.assertNotIn("R1", issue.message)
+        self.assertNotIn("R3", issue.message)
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (4, 0, 0, 1))
+
+    def test_manufacturer_models_and_polarized_capacitors_are_grouped_by_libref(self):
+        self.write_rows([
+            ["1206B104K101NT(FH)", "", "C1", "C1206", " Cap ", 1],
+            ["1206B104K101NT(FH)", "", "C2", "CAP_1206", "CAPACITOR", 1],
+            ["ERJ-3EKF1002V", "", "R1", "R0603", "Res1", 1],
+            ["ERJ-3EKF1002V", "", "R2", "RES_0603", " resistor ", 1],
+            ["EEE-1HA100WR", "", "C3", "CAP-A", " Cap Pol1 ", 1],
+            ["EEE-1HA100WR", "", "C4", "CAP-B", "CAP POL2", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (0, 6, 0, 9))
+        self.assertEqual([issue.code for issue in report.issues],
+                         ["unsupported_comment"] * 6 + ["same_comment_different_footprints"] * 3)
+        self.assertEqual([issue.row for issue in report.issues[-3:]], [2, 4, 6])
+        self.assertTrue(report.ok)
+
+    def test_non_rc_rows_are_excluded_even_when_the_comment_matches_an_rc_row(self):
+        self.write_rows([
+            ["ChipX", "", "U1", "QFN32", "IC", 1],
+            ["ChipX", "", "U2", "QFN48", "IC", 1],
+            ["LED-A", "", "D1", "LED0402", "LED", 1],
+            ["LED-A", "", "D2", "LED0603", "LED", 1],
+            ["1206B104K101NT(FH)", "", "C1", "C1206", "", 1],
+            ["1206B104K101NT(FH)", "", "C2", "C0402", "", 1],
+            ["ManufacturerPart", "", "C3", "C0603", "Cap", 1],
+            ["ManufacturerPart", "", "U3", "QFN48", "IC", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual([issue.code for issue in report.issues], ["unsupported_comment"])
+        self.assertEqual(report.issues[0].row, 8)
+        self.assertEqual((report.checked, report.skipped, report.warnings), (0, 8, 1))
+
+    def test_non_rc_components_skip_standard_comment_and_footprint_rules(self):
+        self.write_rows([
+            ["IC_M1206", "", "U1", "M1220", "IC", 1],
+            ["LED-A", "", "D1", "LED0603", "LED", 1],
+            ["CONN-10", "", "J1", "HEADER-10", "Connector", 1],
+            ["MARK", "", "M1", "MARK-1MM", "MarkPoint", 1],
+            ["MillMax-2501-2", "", "TP1", "TESTPOINT", "TestPoint", 1],
+            ["VendorUnknown", "", "U2", "QFN", "", 1],
+        ])
+        before = self.source.read_bytes()
+        report = validate_workbook(self.source)
+        self.assertEqual(report.issues, ())
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (0, 6, 0, 0))
+        self.assertTrue(report.ok)
+        self.assertEqual(self.source.read_bytes(), before)
+
+    def test_non_rc_components_still_receive_designator_quantity_and_missing_field_checks(self):
+        self.write_rows([
+            ["ChipX", "", "U1,U1", "QFN", "IC", 2],
+            ["LED-A", "", "u1", "LED0603", "LED", 2],
+            ["CONN-10", "", None, None, "Connector", 0],
+            [None, "", "U2", "QFN", "IC", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual([issue.code for issue in report.issues],
+                         ["duplicate_designator", "duplicate_designator", "quantity_mismatch",
+                          "missing_designator", "invalid_quantity", "missing_footprint", "missing_comment"])
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (0, 4, 7, 0))
+        self.assertFalse(report.ok)
+
+    def test_unknown_rc_and_polarized_capacitor_models_still_warn(self):
+        self.write_rows([
+            ["1206B104K101NT(FH)", "", "C1", "C1206", " Cap ", 1],
+            ["ERJ-3EKF1002V", "", "R1", "R0603", " resistor ", 1],
+            ["EEE-1HA100WR", "", "C2", "CAP-A", " Cap Pol1 ", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual([issue.code for issue in report.issues], ["unsupported_comment"] * 3)
+        self.assertEqual([issue.row for issue in report.issues], [2, 3, 4])
+        self.assertTrue(all(issue.severity == "warning" for issue in report.issues))
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (0, 3, 0, 3))
+        self.assertTrue(report.ok)
+
+    def test_empty_comments_and_footprints_do_not_create_groups(self):
+        self.write_rows([
+            [None, "", "C1", "C0402", "Cap", 1],
+            ["", "", "C2", "C0603", "Cap", 1],
+            ["  ", "", "C3", "C0805", "Cap", 1],
+            ["0402K1002", "", "R1", None, "Res", 1],
+            ["0402K1002", "", "R2", "  ", "Res", 1],
+            ["0402K1002", "", "R3", "R0402", "Res", 1],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual([issue.code for issue in report.issues],
+                         ["missing_comment"] * 3 + ["missing_footprint"] * 2)
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (1, 5, 5, 0))
+
+    def test_group_warning_is_appended_after_existing_row_errors(self):
+        self.write_rows([
+            ["0402K1002", "", "R1", "R0402", "Res", 1],
+            ["0402K1002", "", "R1", "C0603", "Res", 2],
+        ])
+        report = validate_workbook(self.source)
+        self.assertEqual([issue.code for issue in report.issues],
+                         ["duplicate_designator", "quantity_mismatch", "package_mismatch",
+                          "component_type_mismatch", "same_comment_different_footprints"])
+        self.assertEqual((report.checked, report.skipped, report.errors, report.warnings), (2, 0, 4, 1))
+        self.assertFalse(report.ok)
+        self.assertEqual(report.issues[-1].row, 2)
+        self.assertEqual(report.issues[-1].severity, "warning")
+
+    def test_group_checks_only_the_selected_worksheet_without_modifying_workbook(self):
+        self.write_rows([
+            ["0402K1002", "", "R1", "R0402", "Res", 1],
+            ["0402K1002", "", "R2", "R0402", "Res", 1],
+        ])
+        book = load_workbook(self.source)
+        other = book.copy_worksheet(book.active)
+        other.title = "另一张 AD"
+        other["D3"] = "R 0402"
+        book.save(self.source)
+        book.close()
+        before = self.source.read_bytes()
+        report = validate_workbook(self.source, sheet="AD export")
+        self.assertEqual(report.issues, ())
+        report = validate_workbook(self.source, sheet="另一张 AD")
+        self.assertEqual(report.sheet, "另一张 AD")
+        self.assertEqual([issue.code for issue in report.issues], ["same_comment_different_footprints"])
+        self.assertEqual((report.checked, report.skipped), (2, 0))
+        self.assertEqual(self.source.read_bytes(), before)
 
     def test_duplicate_designators_and_quantity_mismatch(self):
         self.write_rows([
@@ -124,8 +321,12 @@ class ValidationTests(unittest.TestCase):
         before = hashlib.sha256(source.read_bytes()).hexdigest()
         report = validate_workbook(source)
         self.assertEqual((report.checked, report.skipped, report.errors, report.warnings),
-                         (91, 51, 0, 51))
-        self.assertEqual({issue.code for issue in report.issues}, {"unsupported_comment"})
+                         (91, 51, 0, 11))
+        self.assertEqual({issue.code for issue in report.issues},
+                         {"unsupported_comment", "same_comment_different_footprints"})
+        self.assertEqual([issue.code for issue in report.issues[:5]], ["unsupported_comment"] * 5)
+        self.assertEqual([issue.row for issue in report.issues[:5]], [11, 12, 13, 29, 43])
+        self.assertEqual([issue.code for issue in report.issues[5:]], ["same_comment_different_footprints"] * 6)
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
 
 

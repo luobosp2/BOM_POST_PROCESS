@@ -44,6 +44,109 @@ class CliTests(unittest.TestCase):
         self.assertEqual(data["errors"], 1)
         self.assertEqual(self.source.read_bytes(), before)
 
+    def test_merge_warnings_are_not_truncated_and_json_contains_all_details(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Comment", "Description", "Designator", "Footprint", "LibRef", "Quantity"])
+        for index in range(10):
+            sheet.append([f"VendorCap-{index}", "", f"C{index}", "C0603", "Cap", 1])
+        for index in range(9):
+            model = f"0402K{1000 + index}"
+            sheet.append([model, "", f"R{index + 1}A", "R0402", "Res", 1])
+            sheet.append([model, "", f"R{index + 1}B", "0402R", "Res", 1])
+        workbook.save(self.source)
+        workbook.close()
+        before = self.source.read_bytes()
+        output = self.folder / "report.json"
+        code, stdout, stderr = self.run_cli("validate", self.source, "-o", output)
+        self.assertEqual(code, 0)
+        self.assertIn("错误 0，提示 19", stdout)
+        self.assertEqual(stderr.count("请核对封装并合并对应 BOM 条目"), 9)
+        self.assertEqual(stderr.count("未验证封装一致性"), 8)
+        self.assertIn("另有 2 条提示", stderr)
+        data = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual((data["checked"], data["skipped"], data["warnings"]), (18, 10, 19))
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(data["issues"]), 19)
+        groups = [item for item in data["issues"] if item["code"] == "same_comment_different_footprints"]
+        self.assertEqual(len(groups), 9)
+        for index, group in enumerate(groups):
+            self.assertEqual(group["row"], 12 + 2 * index)
+            self.assertEqual(group["severity"], "warning")
+            self.assertEqual(group["comment"], f"0402K{1000 + index}")
+            self.assertEqual(group["designator"], f"R{index + 1}A")
+            self.assertEqual(group["footprint"], "R0402")
+            self.assertIn(group["message"], stderr)
+            for value in (f"第 {12 + 2 * index} 行", f"第 {13 + 2 * index} 行",
+                          f"R{index + 1}A", f"R{index + 1}B", "R0402", "0402R"):
+                self.assertIn(value, group["message"])
+        self.assertEqual(self.source.read_bytes(), before)
+
+    def test_non_rc_components_do_not_emit_comment_warnings_in_console_or_json(self):
+        workbook = load_workbook(self.source)
+        for row in [
+            ["ChipX", "", "U1", "QFN32", "IC", 1],
+            ["ConnectorX", "", "J1", "HDR2", "Connector", 1],
+            ["LED-RED", "", "D1", "LED0603", "LED", 1],
+            ["Testpoint", "", "TP1", "TESTPOINT", "Testpoint", 1],
+            ["MarkX", "", "M1", "MARK", "Markpoint", 1],
+            ["VendorCap", "", "C1", "C0603", "Cap", 1],
+        ]:
+            workbook.active.append(row)
+        workbook.save(self.source)
+        workbook.close()
+        before = self.source.read_bytes()
+        output = self.folder / "report.json"
+        code, stdout, stderr = self.run_cli("validate", self.source, "-o", output)
+        self.assertEqual(code, 0)
+        self.assertIn("错误 0，提示 1", stdout)
+        self.assertEqual(stderr.count("未验证封装一致性"), 1)
+        self.assertIn("[C1]", stderr)
+        for designator in ("U1", "J1", "D1", "TP1", "M1"):
+            self.assertNotIn(f"[{designator}]", stderr)
+        data = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual((data["checked"], data["skipped"], data["warnings"]), (1, 6, 1))
+        self.assertTrue(data["ok"])
+        self.assertEqual([(issue["code"], issue["designator"]) for issue in data["issues"]],
+                         [("unsupported_comment", "C1")])
+        self.assertEqual(self.source.read_bytes(), before)
+
+    def test_merge_warning_does_not_prevent_exports_or_merge_rows(self):
+        workbook = load_workbook(self.source)
+        workbook.active.append(["0402K1002", "", "R2", "0402R", "Res", 1])
+        workbook.save(self.source)
+        workbook.close()
+        before = self.source.read_bytes()
+        code, _, stderr = self.run_cli("validate", self.source)
+        self.assertEqual(code, 0)
+        self.assertIn("请核对封装并合并对应 BOM 条目", stderr)
+        parsed = self.folder / "parsed.xlsx"
+        soldering = self.folder / "soldering.xlsx"
+        bom = self.folder / "BOM.xlsx"
+        self.assertEqual(self.run_cli("gen_value", self.source, "-o", parsed)[0], 0)
+        self.assertEqual(self.run_cli("gen_soldering", parsed, "-o", soldering)[0], 0)
+        self.assertEqual(self.run_cli("gen_bom", parsed, "-o", bom)[0], 0)
+        self.assertEqual(self.source.read_bytes(), before)
+        for path, first_material_row, designator_column in ((parsed, 2, 3), (soldering, 2, 5), (bom, 3, 5)):
+            book = load_workbook(path)
+            try:
+                self.assertEqual([book.active.cell(row, designator_column).value
+                                  for row in range(first_material_row, book.active.max_row + 1)],
+                                 ["R1", "R2"])
+            finally:
+                book.close()
+
+    def test_package_error_still_fails_when_merge_warning_is_present(self):
+        workbook = load_workbook(self.source)
+        workbook.active.append(["0402K1002", "", "R2", "R0603", "Res", 1])
+        workbook.save(self.source)
+        workbook.close()
+        code, stdout, stderr = self.run_cli("validate", self.source)
+        self.assertEqual(code, 1)
+        self.assertIn("错误 1，提示 1", stdout)
+        self.assertIn("Footprint 指定 0603", stderr)
+        self.assertIn("请核对封装并合并对应 BOM 条目", stderr)
+
     def test_gen_value_and_collision(self):
         output = self.folder / "nested" / "parsed.xlsx"
         code, _, _ = self.run_cli("gen_value", self.source, "-o", output)

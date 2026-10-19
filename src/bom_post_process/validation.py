@@ -2,7 +2,8 @@
 
 Package checks use the project's complete resistor/capacitor naming rules. They
 do not infer a package from arbitrary digits inside a manufacturer's part number.
-Unknown models and footprint aliases remain explicit warnings, not verified rows.
+Unrecognized passive models and footprint aliases remain explicit warnings.
+Other component categories skip these passive-specific checks without warnings.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 
-from .components import CAPACITOR_RE, RESISTOR_RE, normalize_model
+from .components import CAPACITOR_RE, RESISTOR_RE, component_kind, normalize_model
 from .errors import BomError
 from .workbook import AdRow, AdTable, read_ad_workbook, tokenize_designators
 
@@ -42,9 +43,11 @@ class ValidationReport:
     """A JSON-serializable report; ``ok`` only means no detected errors.
 
     ``checked`` counts rows whose Comment and Footprint could be compared,
-    including rows with detected conflicts. ``skipped`` counts every other row.
-    Warnings describe the unverified scope and must not be treated as approval
-    of the complete BOM. All rows receive designator and quantity checks.
+    including rows with detected conflicts. ``skipped`` counts every other row,
+    including non-passive components that do not need the package check.
+    Warnings describe unverified passives or passive rows that may need merging;
+    they are not approval of the complete BOM. All rows receive designator and
+    quantity checks.
     """
 
     sheet: str
@@ -96,6 +99,7 @@ def validate_table(table: AdTable) -> ValidationReport:
     issues: list[ValidationIssue] = []
     checked = 0
     seen_designators: dict[str, int] = {}
+    passive_groups: dict[str, list[AdRow]] = {}
 
     def issue(row: AdRow, severity: str, code: str, message: str) -> None:
         issues.append(ValidationIssue(
@@ -109,6 +113,16 @@ def validate_table(table: AdTable) -> ValidationReport:
         ))
 
     for row in table.rows:
+        is_passive = (
+            component_kind(row.comment, row.libref) is not None
+            or row.libref.strip().casefold().startswith("cap pol")
+        )
+        # Group the original Comment, keeping NC distinct from mounted parts.
+        # LibRef also identifies vendor-specific models and polarized capacitors
+        # whose parameters cannot be parsed by the standard naming rules.
+        if is_passive and row.comment.strip() and row.footprint.strip():
+            passive_groups.setdefault(row.comment.strip().casefold(), []).append(row)
+
         designators = tokenize_designators(row.designator)
         if not designators:
             issue(row, "error", "missing_designator", "Designator 位号为空")
@@ -132,6 +146,9 @@ def validate_table(table: AdTable) -> ValidationReport:
             issue(row, "error", "missing_footprint", "Footprint 封装为空")
         if not row.comment.strip():
             issue(row, "error", "missing_comment", "Comment 料号为空")
+            continue
+
+        if not is_passive:
             continue
 
         model = normalize_model(row.comment)
@@ -162,6 +179,17 @@ def validate_table(table: AdTable) -> ValidationReport:
             names = {"C": "电容", "R": "电阻"}
             issue(row, "error", "component_type_mismatch",
                   f"Comment 为{names[kind]}，Footprint 别名表示{names[footprint_kind]}")
+
+    for rows in passive_groups.values():
+        if len({row.footprint.strip().casefold() for row in rows}) < 2:
+            continue
+        first = rows[0]
+        details = "；".join(
+            f"第 {row.row} 行 [{row.designator}] Footprint={row.footprint!r}" for row in rows
+        )
+        issue(first, "warning", "same_comment_different_footprints",
+              f"Comment {first.comment!r} 相同但 Footprint 不同：{details}。"
+              "请核对封装并合并对应 BOM 条目")
 
     return ValidationReport(table.sheet, checked, len(table.rows) - checked, tuple(issues))
 
